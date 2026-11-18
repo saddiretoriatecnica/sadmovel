@@ -411,6 +411,38 @@ function refuseBook(id,reason){
   p.lines=[];p.status='devolvido';p.retReason=reason;p.retBy=u.name;p.retTs=new Date().toISOString();p.byRT=true;p.corrigirPor=p.medicoId;
   p.confBy=null;p.confById=null;p.efetTs=null;
   log('RT recusou a ficha de '+p.name+' antes do livro e devolveu para '+p.medico+' ('+reason+'). Estoque estornado.');save();return{errs:[]};}
+/* ===== Cancelamento de atendimento (só RT) =====
+   Antes do livro: estorna a baixa e apaga as movimentações da ficha (como a recusa).
+   Depois do livro: as linhas validadas ficam; cada controlado recebe UMA linha de errata/estorno (entrada) que devolve ao estoque.
+   Cada linha original só pode ser estornada uma vez (estornoDe). A ficha não é apagada: fica com situação "Cancelada" e sai das listas e relatórios. */
+const CANCEL_ST=['pendente','devolvido','efetivado'];
+const sealedMov=m=>!!m.rtBy&&!m.bookPend;
+const estornada=m=>S.movs.some(x=>x.estornoDe===m.id);
+const movLbl=m=>m.estorno?['ok','Estorno (entrada)']:(TIPO[m.type]||['none',m.type]);
+function cancelPlan(p){
+  const mv=S.movs.filter(m=>m.patientId===p.id),sealed=mv.filter(m=>sealedMov(m)&&m.type==='saida'),free=mv.filter(m=>!sealedMov(m));
+  const byItem={};sealed.forEach(m=>{const g=byItem[m.itemId]||(byItem[m.itemId]={id:m.itemId,movs:[],qty:0,done:0,manual:[]});g.movs.push(m);if(estornada(m))g.done=R(g.done+m.qty);else g.qty=R(g.qty+m.qty);});
+  const since=p.efetTs||p.ts||'';
+  Object.values(byItem).forEach(g=>{g.manual=S.movs.filter(x=>x.itemId===g.id&&x.manual&&x.type==='entrada'&&!x.estorno&&(x.ts||'')>=since);});
+  return{sealed,free,ctrl:Object.values(byItem),freeSaidas:free.filter(m=>m.type==='saida')};}
+function cancelPatient(id,reason,skip){
+  const p=S.patients.find(x=>x.id===id),u=curUser();skip=skip||new Set();
+  if(!p||!can('rtConfirm'))return{errs:['Só o RT pode cancelar atendimentos.']};
+  if(!CANCEL_ST.includes(p.status))return{errs:['Esta ficha não pode ser cancelada (situação: '+(STATUS_LBL[p.status]||p.status)+').']};
+  if(!reason)return{errs:['Escreva o motivo do cancelamento.']};
+  const now=new Date().toISOString(),pl=cancelPlan(p),prev=p.status;
+  pl.freeSaidas.forEach(undoSaida);
+  const freeIds=new Set(pl.free.map(m=>m.id));S.movs=S.movs.filter(m=>!freeIds.has(m.id));
+  let nEst=0;const sem=[];
+  pl.sealed.forEach(m=>{const it=getItem(m.itemId);if(!it||estornada(m))return;
+    if(skip.has(m.itemId)){if(!sem.includes(it.name))sem.push(it.name);return;}
+    undoSaida(m);
+    addMov({date:todayISO(),itemId:it.id,type:'entrada',estorno:true,estornoDe:m.id,manual:true,qty:m.qty,lote:m.lote||'',val:m.val||null,nf:m.nf||'',
+      desc:'Errata — estorno do atendimento cancelado de '+p.name+' ('+fmtD(p.date)+'): devolução ao estoque',obs:reason,user:u.name,role:u.role,rtBy:u.name,rtTs:now});nEst++;});
+  p.cancel={by:u.name,byId:u.id,ts:now,reason,prev,estornos:nEst,semEstorno:sem,itens:pl.freeSaidas.length};
+  p.status='cancelado';
+  log('RT cancelou o atendimento de '+p.name+' ('+fmtD(p.date)+'): '+reason+'. '+(prev==='efetivado'?'Estoque estornado'+(nEst?'; '+nEst+' linha(s) de errata/estorno no livro':'')+(sem.length?'; sem estorno no livro: '+sem.join(', '):''):'Ficha ainda não tinha dado baixa no estoque')+'.');
+  save();return{errs:[],nEst,sem,prev};}
 function sigParts(r){
   const a=[['Preencheu',r.user+' ('+(ROLES[r.role]||r.role)+')']];
   if(r.type==='saida'&&(r.conf||r.med))a.push(['Médico que confirmou',r.conf||r.med]);
@@ -571,7 +603,7 @@ function vPainel(){
     reqs=can('rtConfirm')?pendRT().concat(pendLivroFichas()):[],
     banner=(()=>{const sd=can('rtConfirm')?pendentesPara(cu0).filter(p=>p.medicoId!==cu0.id&&fichaCtrl(p).length):[];return sd.length?'<div class="bigwarn" role="alert"><b>'+sd.length+(sd.length>1?' fichas com psicotrópicos sem':' ficha com psicotrópicos sem')+' confirmação do anestesista</b> <button class="btn sm" data-act="nav" data-v="fichas">Ver fichas</button></div>':'';})()+(reqs.length?'<div class="err" style="background:var(--warn-bg);color:var(--warn)"><b>'+reqs.length+' lançamento(s) de controlados aguardando a sua confirmação no livro.</b> <button class="btn sm" data-act="nav" data-v="fichas">Confirmar agora</button></div>':'')+(aguard.length?'<div class="err" style="background:var(--warn-bg);color:var(--warn)"><b>'+aguard.length+(aguard.length>1?' fichas aguardam':' ficha aguarda')+' a sua conferência.</b> <button class="btn sm" data-act="nav" data-v="fichas">Conferir agora</button></div>':'')+
     (minhas.length?'<div class="err" style="background:var(--warn-bg);color:var(--warn)">Você tem '+minhas.filter(p=>p.status==='pendente').length+' ficha(s) aguardando o médico e '+minhas.filter(p=>p.status==='devolvido').length+' devolvida(s) para correção. <button class="btn ghost sm" data-act="nav" data-v="fichas">Ver fichas</button></div>':'');
-  const pats=S.patients.filter(visPat).slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
+  const pats=S.patients.filter(p=>visPat(p)&&p.status!=='cancelado').slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
   const dr=draftGet();
   return '<h2>Painel</h2>'+
   '<div class="bar" style="margin:8px 0 16px">'+(can('atendimento')?'<button class="btn big" data-act="nav" data-v="atendimento">'+(dr?'Continuar atendimento em andamento':'＋ Novo atendimento')+'</button>':'')+(can('estoque')?'<button class="btn big ghost" data-act="nav" data-v="estoque">Estoque</button>':'')+(dr&&can('atendimento')?'<span class="muted sm">Há um rascunho salvo neste login.</span>':'')+'</div>'+banner+
@@ -630,7 +662,7 @@ function openItem(id){
    (can('custos')?'<div class="stat"><div class="v">'+brl(it.price)+'</div><div class="l">Preço unitário</div></div>':'')+'</div>'+
    (it.o2?o2Card(it):'')+(it.obs?'<p class="sm"><b>Observação:</b> '+esc(it.obs)+'</p>':'')+
    '<h3>'+(isMed?'Lotes':'Validades')+'</h3><div class="tw"><table><thead><tr>'+(isMed?'<th>Lote</th>':'')+'<th>Validade</th><th>Situação</th><th>Qtde</th>'+(isMed?'<th>Nota fiscal</th><th>Fornecedor</th>':'')+'</tr></thead><tbody>'+lots+'</tbody></table></div>'+
-   '<h3 style="margin-top:14px">Últimas movimentações</h3>'+(ms.length?'<div class="tw"><table><thead><tr><th>Data</th><th>Tipo</th><th>Qtde</th><th>Descrição</th><th>Responsável</th></tr></thead><tbody>'+ms.map(m=>'<tr><td>'+fmtD(m.date)+'</td><td>'+pill(tipo[m.type][0],tipo[m.type][1])+'</td><td class="num">'+nf(m.qty)+'</td><td>'+esc(m.desc||'')+'</td><td>'+esc(m.user)+'</td></tr>').join('')+'</tbody></table></div>':'<p class="muted">Sem movimentações registradas.</p>')+
+   '<h3 style="margin-top:14px">Últimas movimentações</h3>'+(ms.length?'<div class="tw"><table><thead><tr><th>Data</th><th>Tipo</th><th>Qtde</th><th>Descrição</th><th>Responsável</th></tr></thead><tbody>'+ms.map(m=>'<tr><td>'+fmtD(m.date)+'</td><td>'+pill(movLbl(m)[0],movLbl(m)[1])+'</td><td class="num">'+nf(m.qty)+'</td><td>'+esc(m.desc||'')+'</td><td>'+esc(m.user)+'</td></tr>').join('')+'</tbody></table></div>':'<p class="muted">Sem movimentações registradas.</p>')+
    '<div class="bar" style="margin-top:14px">'+(can('itens')?'<button class="btn ghost" data-act="editItem" data-id="'+id+'">Editar item</button>':'')+(can('itens')&&it.off?'<button class="btn ghost" data-act="toggleOff" data-id="'+id+'">Voltar ao uso</button>':'')+(can('itens')&&!it.off&&stockOf(it)<=0?'<button class="btn ghost" data-act="toggleOff" data-id="'+id+'">Tirar de uso (sem estoque)</button>':'')+(can('entrada')?'<button class="btn" data-act="goEntrada" data-id="'+id+'">Registrar entrada</button>':'')+(can('perda')?'<button class="btn ghost" data-act="goPerda" data-id="'+id+'">Registrar perda</button>':'')+'</div>');}
 function itemForm(id,kind){
   const it=id?getItem(id):null,k=it?it.kind:kind;
@@ -695,7 +727,7 @@ function itemRowHtml(it){
   const step=it.id==='I23'?10:it.id==='M39'?5:1;
   const stp='<div class="stp"><button type="button" data-act="stp" data-t="u-'+it.id+'" data-d="-'+step+'" aria-label="Diminuir '+esc(it.name)+'">−</button><input type="number" min="0" step="1" value="0" data-use="'+it.id+'" id="u-'+it.id+'" inputmode="numeric" aria-label="Quantidade de '+esc(it.name)+'"><button type="button" data-act="stp" data-t="u-'+it.id+'" data-d="'+step+'" aria-label="Aumentar '+esc(it.name)+'">+</button></div>';
   if(it.o2)return '<div class="irow multi" data-s="'+search+'"><div class="nm"><b>'+esc(it.name)+'</b><span class="muted sm">Registre o tempo de uso e o fluxo</span></div><div class="mopts" style="flex-direction:column;align-items:flex-start;gap:10px"><label>Tempo de uso (minutos)<div class="stp"><button type="button" data-act="stp" data-t="u-'+it.id+'" data-d="-10" aria-label="Diminuir minutos">−</button><input type="number" min="0" step="1" value="0" data-use="'+it.id+'" id="u-'+it.id+'" inputmode="numeric" aria-label="Tempo de oxigênio em minutos"><button type="button" data-act="stp" data-t="u-'+it.id+'" data-d="10" aria-label="Aumentar minutos">+</button></div></label><label>Fluxo utilizado (litros por minuto)<input type="number" min="0.5" step="0.5" value="2" id="fl-'+it.id+'" data-flow="'+it.id+'" inputmode="decimal" aria-label="Fluxo de oxigênio em litros por minuto" style="width:90px"></label><span class="mnote" id="mn-'+it.id+'"></span></div></div>';
-  if(it.multi)return '<div class="irow multi" data-s="'+search+'">'+nm+stp+'<div class="mopts"><label><input type="checkbox" id="n-'+it.id+'"> Ampola nova</label><label><input type="checkbox" id="a-'+it.id+'"> Ampola já aberta (multidose)</label><span class="mnote" id="mn-'+it.id+'"></span></div></div>';
+  if(it.multi)return '<div class="irow multi" data-s="'+search+'">'+nm+stp+'<div class="mopts"><label><input type="checkbox" id="n-'+it.id+'"> Ampola nova (aberta agora para este paciente)</label><label><input type="checkbox" id="a-'+it.id+'"> Sobra de ampola já aberta (sem baixa)</label><span class="mnote" id="mn-'+it.id+'"></span></div></div>';
   return '<div class="irow" data-s="'+search+'">'+nm+stp+'</div>';}
 function vAtend(){
   if(UI.atStep!=='form'&&!UI.reuse)return vChkSaida();
@@ -736,7 +768,7 @@ function entRow(){
    (can('custos')?'<label><span class="lp">Preço pago por unidade (R$)</span><input class="e-price" id="ep'+n+'" type="number" min="0" step="0.01"></label>':'<span></span>')+
    '<button type="button" class="btn danger sm" data-act="delRow">Remover</button><div class="hint e-hint">Escolha o item para ver as exigências.</div></div>';}
 function vEntradas(){
-  const rec=S.movs.filter(m=>m.type==='entrada'&&m.user!=='Carga inicial').sort((a,b)=>b.id-a.id).slice(0,12),pe=S.pend.filter(r=>r.type==='entrada'&&r.status==='pendente');
+  const rec=S.movs.filter(m=>m.type==='entrada'&&!m.estorno&&m.user!=='Carga inicial').sort((a,b)=>b.id-a.id).slice(0,12),pe=S.pend.filter(r=>r.type==='entrada'&&r.status==='pendente');
   return '<h2>Compras e entradas</h2><p class="sub">Uma nota fiscal pode ter vários itens. Medicamentos exigem validade; lote e nota fiscal são obrigatórios só nos controlados. Insumos não têm lote: só a quantidade e, se quiser acompanhar o alerta, a validade. Controlados só somam ao estoque e entram no livro depois que o RT confirmar o recebimento (quando o RT lança, entra direto).</p>'+
   '<form id="fEnt"><div class="card"><div class="grid"><label>Data da entrada<input id="enDate" type="date" required value="'+todayISO()+'"></label>'+
    '<label>Nota fiscal<input id="enNF" placeholder="Número da NF" autocomplete="off"></label>'+
@@ -806,9 +838,9 @@ function bookTable(it,from,to){
   let body='';let n=0;
   if(bd.prev!=null)body+='<tr><td></td><td colspan="7" class="muted">Saldo anterior ao período</td><td class="num"><b>'+nf(bd.prev)+'</b></td><td colspan="2"></td></tr>';
   bd.rows.forEach(r=>{n++;const q=signedQty(r),sp=sigParts(r),ex=r.manual?'Linha lançada pelo RT':'',sig=sp.map(x=>x[0]+': '+x[1]).join(' · ')+(ex?' · '+ex:'')+' · '+fmtTs(r.ts);
-    body+='<tr><td class="num muted">'+n+'</td><td>'+fmtD(r.date)+'</td><td>'+pill(TIPO[r.type][0],TIPO[r.type][1])+'</td><td>'+esc(r.desc||'')+'</td><td class="mono">'+esc(r.lote||'—')+'</td><td>'+fmtD(r.val)+'</td><td>'+esc(r.nf||'—')+'</td>'+
+    body+='<tr><td class="num muted">'+n+'</td><td>'+fmtD(r.date)+'</td><td>'+pill(movLbl(r)[0],movLbl(r)[1])+'</td><td>'+esc(r.desc||'')+'</td><td class="mono">'+esc(r.lote||'—')+'</td><td>'+fmtD(r.val)+'</td><td>'+esc(r.nf||'—')+'</td>'+
       '<td class="num '+(q<0?'t-crit':'t-ok')+'">'+(r.type==='errata'?'—':(q>0?'+':'−')+nf(Math.abs(q)))+'</td><td class="num"><b>'+nf(r.bal)+'</b></td><td>'+esc(r.obs||'')+'</td><td class="sig">'+sp.map(x=>'<span class="muted">'+esc(x[0])+':</span> '+esc(x[1])).join('<br>')+'<br><span class="muted">'+(ex?esc(ex)+' · ':'')+fmtTs(r.ts)+'</span></td></tr>';
-    tsv.push([n,fmtD(r.date),TIPO[r.type][1],r.desc||'',r.lote||'',fmtD(r.val),r.nf||'',(r.type==='errata'?'':String(q).replace('.',',')),String(r.bal).replace('.',','),r.obs||'',sig].join('\t'));});
+    tsv.push([n,fmtD(r.date),movLbl(r)[1],r.desc||'',r.lote||'',fmtD(r.val),r.nf||'',(r.type==='errata'?'':String(q).replace('.',',')),String(r.bal).replace('.',','),r.obs||'',sig].join('\t'));});
   if(!bd.rows.length)body+='<tr><td colspan="11" class="muted">Nenhuma movimentação no período.</td></tr>';
   const ok=bookOk(it),npd=bookPendMovs(it).length;
   const head='<div class="book-h"><div><div class="l">Medicamento</div><b>'+esc(it.name)+(it.desc?' '+esc(it.desc):'')+'</b></div><div><div class="l">Livro / lista</div>'+esc(S.books.find(b=>b.n===it.ctrl.book).name)+(it.ctrl.list?' · '+esc(it.ctrl.list):'')+'</div><div><div class="l">Unidade</div>'+unitOf(it)+'</div><div><div class="l">Saldo atual</div><b class="mono">'+nf(stockOf(it))+'</b></div><div><div class="l">Conferência</div>'+(ok?pill('ok','Livro confere com o estoque'+(npd?' ('+npd+' linha(s) aguardando o RT)':'')):pill('crit','Divergência: livro '+nf(bd.final)+' × estoque '+nf(stockOf(it))))+'</div></div>';
@@ -835,11 +867,11 @@ function vLivros(){
   '<div id="livroOut">'+livroOut()+'</div><p class="sm muted">Cada lançamento carrega o nome e o perfil de quem o fez, mais data e hora, como assinatura digital. As linhas não podem ser editadas nem apagadas; correções entram como nova linha (entrada, saída, perda ou errata), com descrição e observação, lançada pelo RT. Confirme com a vigilância sanitária local se o livro digital substitui o físico ou serve de rascunho para o preenchimento.</p>';}
 
 /* ===== Relatórios por paciente e fichas ===== */
-const STATUS_LBL={efetivado:'Efetivada',pendente:'Aguardando conferência',devolvido:'Devolvida',refeito:'Refeita'};
-function statusPill(p){const k={efetivado:'ok',pendente:'warn',devolvido:'crit',refeito:'none'}[p.status]||'none';return pill(k,STATUS_LBL[p.status]||p.status);}
+const STATUS_LBL={efetivado:'Efetivada',pendente:'Aguardando conferência',devolvido:'Devolvida',refeito:'Refeita',cancelado:'Cancelada'};
+function statusPill(p){const k={efetivado:'ok',pendente:'warn',devolvido:'crit',refeito:'none',cancelado:'none'}[p.status]||'none';return pill(k,STATUS_LBL[p.status]||p.status);}
 function relList(){
   const f=UI.rel,q=f.q.trim().toLowerCase();
-  return S.patients.filter(p=>p.status!=='refeito'&&visPat(p)&&(!f.from||p.date>=f.from)&&(!f.to||p.date<=f.to)&&(!f.motivo||p.motivo===f.motivo)&&(!f.status||p.status===f.status)&&(!q||p.name.toLowerCase().includes(q)||(p.esp||'').toLowerCase().includes(q))).sort((a,b)=>b.date.localeCompare(a.date)||b.ts.localeCompare(a.ts));}
+  return S.patients.filter(p=>p.status!=='refeito'&&(p.status!=='cancelado'||f.status==='cancelado')&&visPat(p)&&(!f.from||p.date>=f.from)&&(!f.to||p.date<=f.to)&&(!f.motivo||p.motivo===f.motivo)&&(!f.status||p.status===f.status)&&(!q||p.name.toLowerCase().includes(q)||(p.esp||'').toLowerCase().includes(q))).sort((a,b)=>b.date.localeCompare(a.date)||b.ts.localeCompare(a.ts));}
 function relOut(){
   const list=relList(),cu=can('custos'),ef=list.filter(p=>p.status==='efetivado'),tot=R(ef.reduce((s,p)=>s+p.cost,0)),atend=ef.filter(p=>p.motivo==='Atendimento ao paciente'),npend=list.filter(p=>p.status==='pendente').length;
   const bycat={};ef.forEach(p=>p.lines.forEach(l=>{bycat[l.cat]=R((bycat[l.cat]||0)+(l.qty+l.dsc)*l.price);}));
@@ -857,30 +889,48 @@ function vRelatorios(){
   const f=UI.rel;
   return '<h2>Relatório de gastos por paciente</h2><p class="sub">'+(can('todosAtend')?'Todas as fichas lançadas.':'Somente as fichas que você preencheu ou das quais é o médico responsável.')+' Fichas aguardando conferência ainda não dão baixa no estoque e ficam fora dos totais. Clique em uma linha para ver os itens.</p>'+
   '<div class="bar"><label style="flex-direction:row;align-items:center;gap:6px">De<input id="rlFrom" type="date" value="'+f.from+'" style="width:auto"></label><label style="flex-direction:row;align-items:center;gap:6px">Até<input id="rlTo" type="date" value="'+f.to+'" style="width:auto"></label>'+
-   '<select id="rlSt" style="width:auto" aria-label="Status"><option value="">Todos os status</option>'+['efetivado','pendente','devolvido'].map(k=>'<option value="'+k+'" '+(f.status===k?'selected':'')+'>'+STATUS_LBL[k]+'</option>').join('')+'</select>'+
+   '<select id="rlSt" style="width:auto" aria-label="Status"><option value="">Todos os status</option>'+['efetivado','pendente','devolvido','cancelado'].map(k=>'<option value="'+k+'" '+(f.status===k?'selected':'')+'>'+STATUS_LBL[k]+'</option>').join('')+'</select>'+
    '<input id="rlQ" type="search" placeholder="Buscar paciente ou especialidade" value="'+esc(f.q)+'" style="width:240px" aria-label="Buscar"><button class="btn" data-act="copyRel">Copiar para planilha</button><button class="btn" data-act="pdfRel">Gerar PDF</button></div><div id="relOut">'+relOut()+'</div>';}
 function fichaMeta(p){
   return fmtD(p.date)+' · '+esc(motivoOf(p))+(p.esp?' · '+esc(espOf(p)):'')+(p.idade!==''&&p.idade!=null?' · '+p.idade+' anos':'')+(p.tp?' · cirurgia '+esc(p.tp):'')+(p.turno?' · '+esc(p.turno):'');}
 function fichaItems(p,cu){
-  const ls=p.status==='efetivado'?p.lines:previewLines(p),w=p.status==='pendente'?shortWarns(p):[];
+  const ls=p.lines&&p.lines.length?p.lines:previewLines(p),w=p.status==='pendente'?shortWarns(p):[];
   const rows=ls.map(l=>{const it=getItem(l.id),used=l.used==null?l.qty:l.used;
-    return '<tr><td>'+esc(l.name)+(it&&it.ctrl?'<span class="tag">Controlado · Livro '+it.ctrl.book+'</span>':'')+(l.aberta?' '+pill('acc',l.nova?'multidose + nova':'multidose'):'')+'</td><td class="num">'+(l.flow?nf(used)+' min × '+nf(l.flow)+' L/min':nf(used)+' '+esc(l.unit))+'</td><td class="num">'+(l.qty?nf(l.qty):'—')+'</td>'+(cu?'<td class="num">'+brl(l.price)+'</td><td class="num">'+brl((l.qty+(l.dsc||0))*l.price)+'</td>':'')+'</tr>';}).join('');
+    return '<tr><td>'+esc(l.name)+(it&&it.ctrl?'<span class="tag">Controlado · Livro '+it.ctrl.book+'</span>':'')+(l.aberta?' '+pill('acc',l.nova?'multidose + nova':'multidose'):'')+(it&&it.ctrl&&used>0&&!l.qty?' '+pill('crit','sem baixa · fora do livro'):'')+'</td><td class="num">'+(l.flow?nf(used)+' min × '+nf(l.flow)+' L/min':nf(used)+' '+esc(l.unit))+'</td><td class="num">'+(l.qty?nf(l.qty):'—')+'</td>'+(cu?'<td class="num">'+brl(l.price)+'</td><td class="num">'+brl((l.qty+(l.dsc||0))*l.price)+'</td>':'')+'</tr>';}).join('');
   return (w.length?'<div class="err" style="background:var(--warn-bg);color:var(--warn)"><b>Atenção ao efetivar:</b><ul>'+w.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>Você pode efetivar mesmo assim; o saldo do controlado ficará negativo e o livro mostrará a divergência.</div>':'')+
   '<div class="tw"><table><thead><tr><th>Item</th><th>Usado</th><th>Baixa no estoque</th>'+(cu?'<th>Preço</th><th>Subtotal</th>':'')+'</tr></thead><tbody>'+rows+
    (p.extra&&p.extra.desc?'<tr><td>'+esc(p.extra.desc)+' <span class="muted">(não listado)</span></td><td class="num">1</td><td class="num">—</td>'+(cu?'<td></td><td class="num">'+brl(p.extra.valor||0)+'</td>':'')+'</tr>':'')+
-   '</tbody>'+(cu?'<tfoot><tr><td colspan="4" style="text-align:right"><b>Total'+(p.status==='efetivado'?'':' estimado')+'</b></td><td class="num"><b>'+brl(p.cost)+'</b></td></tr></tfoot>':'')+'</table></div>'+
+   '</tbody>'+(cu?'<tfoot><tr><td colspan="4" style="text-align:right"><b>Total'+(p.status==='efetivado'?'':p.status==='cancelado'?' (cancelado, fora dos relatórios)':' estimado')+'</b></td><td class="num"><b>'+brl(p.cost)+'</b></td></tr></tfoot>':'')+'</table></div>'+
    '<p class="sm muted" style="margin:6px 0 0">Ampola já aberta (multidose) aparece em &quot;Usado&quot;, mas não conta na baixa nem no custo.'+(p.descOk?' ✓ Preenchimento confirmou que toda sobra de medicamento foi desprezada.':'')+'</p>';}
 function fichaActions(p){
   const u=curUser();let b='';
   if(p.status==='pendente'&&can('conferir')&&(p.medicoId===u.id||u.role==='rt'))
     b+='<button class="btn" data-act="confirmFicha" data-id="'+p.id+'">'+(p.medicoId!==u.id?'Conferir no lugar do anestesista':'Conferir e efetivar')+'</button><button class="btn ghost" data-act="editConfirm" data-id="'+p.id+'">Ajustar e confirmar</button><button class="btn danger" data-act="devolverForm" data-id="'+p.id+'">Devolver para correção</button>';
   if(p.status==='devolvido'&&(p.userId===u.id||p.corrigirPor===u.id)&&can('atendimento'))b+='<button class="btn" data-act="refazer" data-id="'+p.id+'">Corrigir e reenviar</button>';
+  if(CANCEL_ST.includes(p.status)&&can('rtConfirm'))b+='<button class="btn danger" data-act="cancelForm" data-id="'+p.id+'">Cancelar atendimento</button>';
   return b;}
+function cancelForm(p){
+  const pl=cancelPlan(p),ef=p.status==='efetivado',nIns=pl.freeSaidas.length,inBook=pl.ctrl.length>0;
+  let body;
+  if(!ef)body='<p>Esta ficha ainda <b>não deu baixa no estoque</b>. Ao cancelar, ela sai das pendências, dos relatórios e das estatísticas. Nada muda no estoque nem no livro.</p>';
+  else if(!inBook)body='<p>A baixa feita no estoque é <b>estornada</b>: '+nIns+' lançamento(s) de medicamentos e insumos voltam ao estoque, no mesmo lote.'+(pl.free.some(m=>m.bookPend)?' Os controlados ainda <b>não entraram no livro</b>: nenhuma linha é criada.':'')+'</p>';
+  else body='<p>Os insumos e medicamentos não controlados voltam ao estoque ('+nIns+' lançamento(s)).</p>'+
+    '<p>Os controlados desta ficha <b>já estão no livro</b>. As linhas originais continuam lá. Para cada controlado marcado abaixo, o sistema lança no livro <b>uma linha de errata/estorno</b> (entrada, com o motivo) e devolve a quantidade ao estoque. Cada linha só pode ser estornada uma vez.</p>'+
+    pl.ctrl.map(g=>{const it=getItem(g.id),dup=g.manual.length>0;
+      if(!g.qty)return '<div class="okbox">'+esc(it.name)+': já estornado ('+nf(g.done)+' '+esc(unitOf(it))+').</div>';
+      return '<div class="card" style="margin:8px 0;padding:10px 12px"><label class="chkline" style="margin:0"><input type="checkbox" data-cx="'+g.id+'"'+(dup?'':' checked')+'> <span>Devolver <b>'+nf(g.qty)+' '+esc(unitOf(it))+' de '+esc(it.name)+'</b> ao estoque, com linha de errata/estorno no Livro '+it.ctrl.book+'</span></label>'+
+        (dup?'<div class="err" style="background:var(--warn-bg);color:var(--warn);margin:8px 0 0">Já existe entrada lançada à mão neste livro depois desta ficha: '+g.manual.map(x=>fmtD(x.date)+' +'+nf(x.qty)+' ('+esc(x.desc||'')+')').join('; ')+'. Se ela já devolveu esta quantidade, deixe desmarcado para não devolver duas vezes.</div>':'')+'</div>';}).join('');
+  openModal('<div class="mh"><h3>Cancelar atendimento</h3><button class="btn ghost sm" data-act="closeModal">Voltar</button></div>'+
+   '<p class="muted" style="margin-top:0"><b>'+esc(p.name)+'</b> · '+fichaMeta(p)+' · '+statusPill(p)+'</p>'+body+
+   '<p class="sm muted">A ficha não é apagada: fica registrada como <b>Cancelada</b>, com o seu nome, a data e o motivo, e pode ser vista em Relatórios, no filtro "Cancelada".</p>'+
+   '<label>Motivo do cancelamento<textarea id="cxReason" rows="2" required placeholder="Ex.: cadastro em duplicidade do mesmo paciente"></textarea></label><div id="cxErr"></div>'+
+   '<div class="bar"><button class="btn danger" data-act="cancelRun" data-id="'+p.id+'">Cancelar atendimento</button><button class="btn ghost" data-act="closeModal">Voltar</button></div>');}
 function fichaStatusLines(p){
   let t='Preenchida por <b>'+esc(p.user)+'</b> ('+esc(ROLES[p.role]||p.role)+') em '+fmtTs(p.ts)+' · Médico responsável: <b>'+esc(p.medico||'—')+'</b>';
   if(p.status==='efetivado')t+=' · Efetivada em '+fmtTs(p.efetTs||p.ts)+(p.confBy&&p.confBy!==p.user?' após conferência de <b>'+esc(p.confBy)+'</b>':'');
   if(p.status==='efetivado'){const mv=S.movs.filter(m=>m.patientId===p.id&&getItem(m.itemId)&&getItem(m.itemId).ctrl);if(mv.length)t+=mv.some(m=>m.bookPend)?'<br><span class="t-warn">Livro: aguardando validação do RT (estoque já baixado)</span>':'<br>Livro: validado por <b>'+esc(mv[0].rtBy||'—')+'</b> em '+fmtTs(mv[0].rtTs);}
   (p.edits||[]).forEach(e=>{t+='<br><span class="t-warn">Ajustada por <b>'+esc(e.by)+'</b> em '+fmtTs(e.ts)+': '+esc(e.changes.join('; ')||'sem mudança nos dados')+'</span>';});
+  if(p.status==='cancelado'&&p.cancel){const c=p.cancel;t+='<br><span class="t-crit">Cancelada pelo RT <b>'+esc(c.by)+'</b> em '+fmtTs(c.ts)+': '+esc(c.reason)+'.'+(c.prev==='efetivado'?' Estoque estornado'+(c.estornos?'; '+c.estornos+' linha(s) de errata/estorno no livro':'')+(c.semEstorno&&c.semEstorno.length?'; sem estorno no livro: '+esc(c.semEstorno.join(', ')):'')+'.':' A ficha não tinha dado baixa no estoque.')+'</span>';}
   if(p.status==='devolvido')t+='<br><span class="t-crit">Devolvida '+(p.byRT?'pelo RT ':'por ')+esc(p.retBy)+' em '+fmtTs(p.retTs)+(p.byRT?' para correção de <b>'+esc(p.medico||'—')+'</b> (o estoque foi estornado)':'')+': '+esc(p.retReason)+'</span>';
   return t;}
 function openPatient(id){
@@ -904,7 +954,7 @@ function vFichas(){
   const nMine=mine.length+myReq.length;
   return '<h2>'+(isConf?'Conferência':'Minhas pendências')+'</h2><p class="sub">'+(isConf?'Fichas aguardam conferência do médico responsável. Entradas e perdas de controlados aguardam a confirmação do RT. Nada disso muda o estoque nem o livro antes da confirmação.':'O que você enviou e ainda não foi efetivado, ou foi devolvido ou recusado.')+'</p>'+
    (can('conferir')?'<h3>Fichas aguardando conferência ('+conf.length+')</h3>'+(conf.length?conf.map(card).join(''):'<p class="muted">Nenhuma ficha aguardando.</p>'):'')+
-   (can('rtConfirm')?(()=>{const pl=pendLivroFichas();return '<h3 style="margin-top:18px">Fichas aguardando a sua validação para entrar no livro ('+pl.length+')</h3><p class="sm muted" style="margin-top:0">O médico responsável já conferiu e o estoque já foi baixado. Se algo estiver errado, recuse: o estoque é estornado e a ficha volta ao anestesista para corrigir. Ao validar, as linhas dos controlados entram no livro com o nome de quem preencheu, do médico e o seu.</p>'+(pl.length?(pl.length>1?'<div class="bar"><button class="btn" data-act="validateLivroAll">Validar todas ('+pl.length+')</button></div>':'')+pl.map(p=>'<section class="card" style="margin-bottom:12px"><div class="mh"><div><h3 style="margin:0">'+esc(p.name)+'</h3><div class="muted sm">'+fichaMeta(p)+'</div><div class="sm" style="margin-top:4px">'+fichaStatusLines(p)+'</div></div></div><ul>'+S.movs.filter(m=>m.patientId===p.id&&m.bookPend).map(m=>{const it=getItem(m.itemId);return '<li><b>'+esc(it.name)+'</b>: saída de '+nf(m.qty)+' '+esc(unitOf(it))+' · lote '+esc(m.lote||'—')+' (Livro '+it.ctrl.book+')</li>';}).join('')+'</ul><div class="bar"><button class="btn" data-act="validateLivro" data-id="'+p.id+'">Validar e lançar no livro</button><button class="btn danger" data-act="recusarLivroForm" data-id="'+p.id+'">Recusar e devolver ao anestesista</button><button class="btn ghost" data-act="openPatient" data-id="'+p.id+'">Ver ficha</button></div></section>').join(''):'<p class="muted">Nenhuma ficha aguardando validação.</p>');})():'')+
+   (can('rtConfirm')?(()=>{const pl=pendLivroFichas();return '<h3 style="margin-top:18px">Fichas aguardando a sua validação para entrar no livro ('+pl.length+')</h3><p class="sm muted" style="margin-top:0">O médico responsável já conferiu e o estoque já foi baixado. Se algo estiver errado, recuse: o estoque é estornado e a ficha volta ao anestesista para corrigir. Ao validar, as linhas dos controlados entram no livro com o nome de quem preencheu, do médico e o seu.</p>'+(pl.length?(pl.length>1?'<div class="bar"><button class="btn" data-act="validateLivroAll">Validar todas ('+pl.length+')</button></div>':'')+pl.map(p=>'<section class="card" style="margin-bottom:12px"><div class="mh"><div><h3 style="margin:0">'+esc(p.name)+'</h3><div class="muted sm">'+fichaMeta(p)+'</div><div class="sm" style="margin-top:4px">'+fichaStatusLines(p)+'</div></div></div><ul>'+S.movs.filter(m=>m.patientId===p.id&&m.bookPend).map(m=>{const it=getItem(m.itemId);return '<li><b>'+esc(it.name)+'</b>: saída de '+nf(m.qty)+' '+esc(unitOf(it))+' · lote '+esc(m.lote||'—')+' (Livro '+it.ctrl.book+')</li>';}).join('')+ctrlZero(p)+'</ul><div class="bar"><button class="btn" data-act="validateLivro" data-id="'+p.id+'">Validar e lançar no livro</button><button class="btn danger" data-act="recusarLivroForm" data-id="'+p.id+'">Recusar e devolver ao anestesista</button><button class="btn danger" data-act="cancelForm" data-id="'+p.id+'">Cancelar atendimento (duplicado ou indevido)</button><button class="btn ghost" data-act="openPatient" data-id="'+p.id+'">Ver ficha</button></div></section>').join(''):'<p class="muted">Nenhuma ficha aguardando validação.</p>');})():'')+
    (can('rtConfirm')?'<h3 style="margin-top:18px">Controlados aguardando o RT ('+rt.length+')</h3>'+(rt.length?rt.map(reqCard).join(''):'<p class="muted">Nenhum lançamento aguardando.</p>'):'')+
    (nMine||!isConf?'<h3 style="margin-top:18px">Suas pendências ('+nMine+')</h3>'+(nMine?mine.map(card).join('')+myReq.map(reqCard).join(''):'<p class="muted">Nada pendente, devolvido ou recusado.</p>'):'');}
 
@@ -928,7 +978,7 @@ const MID={'<30 min':20,'30-60 min':45,'60-90 min':75,'90-120 min':105,'>120 min
 const pcn=(a,b)=>b?Math.round(a/b*100)+'%':'—';
 const avg=a=>a.length?a.reduce((s,x)=>s+x,0)/a.length:0;
 const hrs=m=>m?(m>=60?Math.floor(m/60)+' h '+String(Math.round(m%60)).padStart(2,'0')+' min':Math.round(m)+' min'):'—';
-function stBase(){const f=UI.st;return S.patients.filter(p=>p.status!=='refeito'&&p.status!=='devolvido'&&visPat(p)&&(!f.from||p.date>=f.from)&&(!f.to||p.date<=f.to));}
+function stBase(){const f=UI.st;return S.patients.filter(p=>p.status!=='refeito'&&p.status!=='devolvido'&&p.status!=='cancelado'&&visPat(p)&&(!f.from||p.date>=f.from)&&(!f.to||p.date<=f.to));}
 function stGroup(list,keyFn){const g={};list.forEach(p=>{const k=keyFn(p);(g[k]=g[k]||[]).push(p);});return g;}
 function stTable(head,rows,empty){return rows.length?'<div class="tw"><table><thead><tr>'+head.map((h,i)=>'<th'+(i?' class="num"':'')+'>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map((c,i)=>'<td'+(i?' class="num"':'')+'>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>':'<p class="muted">'+(empty||'Sem dados no período.')+'</p>';}
 function stBars(rows){const mx=Math.max(1,...rows.map(r=>r[1]));return '<div class="bars">'+rows.map(r=>'<div class="brw"><span>'+esc(r[0])+'</span><div class="b"><i style="width:'+Math.max(2,r[1]/mx*100)+'%"></i></div><span class="num">'+r[2]+'</span></div>').join('')+'</div>';}
@@ -980,9 +1030,9 @@ function stOut(){
      '<div class="stats" style="margin:0 0 12px"><div class="stat"><div class="v">'+nf(tL)+' L</div><div class="l">Consumidos em '+ol.length+' atendimento(s)</div></div><div class="stat"><div class="v">'+(ol.length?nf(Math.round(tL/ol.length)):'—')+' L</div><div class="l">Média por paciente</div></div><div class="stat"><div class="v">'+(tM?nf(R(tL/tM)):'—')+'</div><div class="l">Fluxo médio (L/min)</div></div><div class="stat"><div class="v">'+nf(cyl)+'</div><div class="l">Cilindros recarregados</div></div></div>'+
      stTable(['Especialidade','Pacientes','Tempo médio (min)','Fluxo médio (L/min)','Litros por paciente'].concat(cu?['Custo de O₂ por paciente']:[]),oRows));}
   /* fluxo de fichas */
-  const fl=S.patients.filter(p=>p.status!=='refeito'&&visPat(p)),dv=S.patients.filter(p=>p.refazDe&&visPat(p)).length;
+  const fl=S.patients.filter(p=>p.status!=='refeito'&&visPat(p)),nCx=fl.filter(p=>p.status==='cancelado').length,dv=S.patients.filter(p=>p.refazDe&&visPat(p)).length;
   const fluxo=sec('Qualidade do preenchimento','Fichas devolvidas para correção indicam dados incompletos ou incorretos no lançamento.',
-    stTable(['Situação','Fichas'],[['Efetivadas',fl.filter(p=>p.status==='efetivado').length],['Aguardando conferência',fl.filter(p=>p.status==='pendente').length],['Devolvidas e ainda não refeitas',fl.filter(p=>p.status==='devolvido').length],['Refeitas após devolução',dv]]));
+    stTable(['Situação','Fichas'],[['Efetivadas',fl.filter(p=>p.status==='efetivado').length],['Aguardando conferência',fl.filter(p=>p.status==='pendente').length],['Devolvidas e ainda não refeitas',fl.filter(p=>p.status==='devolvido').length],['Refeitas após devolução',dv],['Canceladas pelo RT',nCx]]));
   return (all.length?'':'<p class="muted">Nenhuma ficha no período.</p>')+checklists+espT+med+custo+perfil+itens+oxi+fluxo;}
 function vEstat(){
   const f=UI.st;
@@ -1025,7 +1075,7 @@ async function buildBooksPdf(items,from,to,cover){
     const rows=[];
     if(bd.prev!=null)rows.push(['','','','Saldo anterior ao período','','','','',nf(bd.prev),'','']);
     bd.rows.forEach((r,i)=>{const q=signedQty(r);
-      rows.push([String(i+1),fmtD(r.date),TIPO[r.type][1],r.desc||'',r.lote||'-',fmtD(r.val),r.nf||'-',r.type==='errata'?'-':(q>0?'+':'-')+nf(Math.abs(q)),nf(r.bal),r.obs||'',sigParts(r).map(x=>x[0]+': '+x[1]).join('\n')+'\n'+(r.manual?'Linha lançada pelo RT · ':'')+fmtTs(r.ts)]);});
+      rows.push([String(i+1),fmtD(r.date),movLbl(r)[1],r.desc||'',r.lote||'-',fmtD(r.val),r.nf||'-',r.type==='errata'?'-':(q>0?'+':'-')+nf(Math.abs(q)),nf(r.bal),r.obs||'',sigParts(r).map(x=>x[0]+': '+x[1]).join('\n')+'\n'+(r.manual?'Linha lançada pelo RT · ':'')+fmtTs(r.ts)]);});
     if(!rows.length)rows.push(['','','','Nenhuma movimentação no período.','','','','','','','']);
     rows.forEach(r=>{const cells=r.map((v,i)=>wrap(v,f,FS,COLS[i][1]-5)),h=Math.max(...cells.map(c=>c.length))*LH+5;
       if(y-h<M+46){head(true);}
@@ -1331,6 +1381,10 @@ const ACT={
   refuseReq:t=>{const why=$('#rfReason').value.trim();if(!why){$('#rfErr').innerHTML='<div class="err">Escreva o motivo da recusa.</div>';return;}
     if(refuseReq(t.dataset.id,why)){closeModal();render();toast('Lançamento recusado.');}},
   newLine:()=>lineForm(UI.livro.item),
+  cancelForm:t=>{const p=S.patients.find(x=>x.id===t.dataset.id);if(p&&can('rtConfirm'))cancelForm(p);},
+  cancelRun:t=>{const why=($('#cxReason')||{}).value;const skip=new Set($$('#modal [data-cx]').filter(x=>!x.checked).map(x=>x.dataset.cx));
+    const r=cancelPatient(t.dataset.id,(why||'').trim(),skip);if(r.errs.length){$('#cxErr').innerHTML='<div class="err">'+esc(r.errs[0])+'</div>';return;}
+    closeModal();render();toast('Atendimento cancelado.'+(r.prev==='efetivado'?' Estoque estornado'+(r.nEst?' e '+r.nEst+' linha(s) de errata/estorno lançada(s) no livro':'')+'.':''));},
   devolverForm:t=>{openModal('<div class="mh"><h3>Devolver ficha para correção</h3><button class="btn ghost sm" data-act="closeModal">Cancelar</button></div><p class="muted">A ficha não dá baixa no estoque. Quem preencheu verá o motivo e poderá corrigir e reenviar.</p><label>Motivo<textarea id="rtReason" rows="3" required></textarea></label><div id="rtErr"></div><div class="bar"><button class="btn danger" data-act="devolverFicha" data-id="'+t.dataset.id+'">Devolver ficha</button></div>');},
   devolverFicha:t=>{const why=$('#rtReason').value.trim();if(!why){$('#rtErr').innerHTML='<div class="err">Escreva o motivo da devolução.</div>';return;}
     if(returnPatient(t.dataset.id,why)){closeModal();render();toast('Ficha devolvida para correção.');}},
@@ -1411,7 +1465,7 @@ function atTotals(){
     let nova=false,aberta=false;if(it.multi){nova=$('#n-'+id).checked;aberta=$('#a-'+id).checked;}
     let eff=effQty(it,used,nova,aberta);row.classList.toggle('on',used>0);
     if(it.o2){const fl=parseFloat(($('#fl-'+id)||{}).value)||0;eff=R(used*fl);const mn2=$('#mn-'+id);if(mn2)mn2.textContent=used>0&&fl>0?'Baixa: '+nf(eff)+' L ('+used+' min × '+nf(fl)+' L/min)':'';if(mn2&&!(used>0&&fl>0))mn2.textContent='';if(used>0){n++;c+=eff*it.price;}return;}
-    const mn=$('#mn-'+id);if(mn)mn.textContent=used>0?(aberta&&nova?'Baixa no estoque: '+eff+' (1 já estava aberta)':aberta?'Multidose: sem baixa no estoque e sem custo':'Baixa no estoque: '+eff):'';
+    const mn=$('#mn-'+id);if(mn){mn.style.color=used>0&&((nova&&aberta&&used<2)||(it.ctrl&&eff===0))?'var(--crit)':'';mn.style.fontWeight=mn.style.color?'600':'';mn.textContent=used>0?(nova&&aberta&&used<2?'Atenção: com 1 ampola marque só uma opção. Com as duas marcadas, a baixa fica 0'+(it.ctrl?' e o psicotrópico não vai para o livro':'')+'.':aberta&&nova?'Baixa no estoque: '+eff+' (1 já estava aberta)':aberta?'Sobra de ampola já aberta: sem baixa no estoque e sem custo'+(it.ctrl?'; não gera linha no livro (a ampola já foi lançada quando foi aberta)':''):'Baixa no estoque: '+eff):'';}
     if(used>0){n++;c+=eff*it.price;}});
   const cnt=$('#atCount');if(cnt)cnt.textContent=n+(n===1?' item':' itens');
   const ce=$('#atCost');if(ce)ce.textContent=brl(c+(parseFloat(($('#atExV')||{}).value)||0));}
@@ -1440,7 +1494,8 @@ function submitAtend(ack){
     if(raw!==''&&!/^\d+$/.test(raw)){errs.push(it.name+': use só números inteiros, sem vírgula.');return;}
     if(used<=0)return;let nova=false,aberta=false;
     if(it.o2){const fl=parseFloat(($('#fl-'+id)||{}).value)||0;if(!(fl>0)){errs.push('Oxigênio: informe o fluxo em L/min.');return;}items.push({id,used,flow:fl,nova:false,aberta:false,qty:R(used*fl),dsc:0});return;}
-    if(it.multi){nova=$('#n-'+id).checked;aberta=$('#a-'+id).checked;if(!nova&&!aberta)errs.push(it.name+': marque "Ampola nova" e/ou "Ampola já aberta (multidose)".');}
+    if(it.multi){nova=$('#n-'+id).checked;aberta=$('#a-'+id).checked;if(!nova&&!aberta)errs.push(it.name+': marque "Ampola nova" e/ou "Sobra de ampola já aberta".');
+      else if(nova&&aberta&&used<2)errs.push(it.name+': com 1 ampola, marque só UMA opção: "Ampola nova" (abriu agora para este paciente) ou "Sobra de ampola já aberta" (usou o que sobrou de outro paciente). As duas juntas só valem quando foram 2 ou mais ampolas.');}
     items.push({id,used,nova,aberta,qty:effQty(it,used,nova,aberta),dsc:0});});
   const exD=g('atExD').value.trim(),exV=g('atExV')?(parseFloat(g('atExV').value)||0):0;
   if(!items.length&&!exD)errs.push('Marque ao menos um item usado.');
@@ -1539,7 +1594,8 @@ function submitItem(form){
   if(wantCtrl&&!t.ctrl){t.ctrl={book,list,sinceId:S.seq+1};if(SERVER)t.ctrl.sinceTs=new Date().toISOString();t.lots.filter(l=>l.qty>0).forEach(l=>addMov({itemId:t.id,type:'entrada',qty:l.qty,lote:l.lote,val:l.val,nf:l.nf,desc:'Saldo inicial incorporado ao livro',obs:'Item marcado como controlado'}));}
   else if(wantCtrl)Object.assign(t.ctrl,{book,list});else t.ctrl=null;
   log((it?'Item editado: ':'Item cadastrado: ')+name);save();closeModal();render();toast(it?'Item atualizado.':'Item cadastrado. Registre a primeira entrada em Compras.');}
-function ctrlLines(items){return items.filter(x=>x.qty>0&&getItem(x.id)&&getItem(x.id).ctrl).map(x=>{const it=getItem(x.id);return '<li><b>'+esc(it.name)+'</b>: '+nf(x.qty)+' '+esc(unitOf(it))+' (Livro '+it.ctrl.book+')</li>';}).join('');}
+function ctrlZero(p){return (p.lines&&p.lines.length?p.lines:previewLines(p)).filter(l=>!l.qty&&(l.used||0)>0&&getItem(l.id)&&getItem(l.id).ctrl).map(l=>'<li class="t-crit"><b>'+esc(getItem(l.id).name)+'</b>: '+nf(l.used)+' '+esc(l.unit)+' usado(s) como sobra de ampola já aberta, <b>sem baixa e fora do livro</b>. Confira se está certo.</li>').join('');}
+function ctrlLines(items){return ctrlZero({items})+items.filter(x=>x.qty>0&&getItem(x.id)&&getItem(x.id).ctrl).map(x=>{const it=getItem(x.id);return '<li><b>'+esc(it.name)+'</b>: '+nf(x.qty)+' '+esc(unitOf(it))+' (Livro '+it.ctrl.book+')</li>';}).join('');}
 function bookAlert(items,act,id,label){
   return '<div class="mh"><h3>Atenção: lançamento no livro de psicotrópicos</h3><button class="btn ghost sm" data-act="closeModal">Cancelar</button></div>'+
    '<div class="err" style="background:var(--warn-bg);color:var(--warn)"><b>Ao confirmar, a baixa é feita no estoque e a linha segue para o livro de psicotrópicos, onde o RT faz a validação final.</b> Depois de validada, a linha não pode mais ser editada. Se precisar ajustar, informe o RT para corrigir no livro.</div>'+
@@ -1554,7 +1610,7 @@ function lineToggle(){
 function lineForm(itemId){
   const its=S.items.filter(i=>i.ctrl&&i.ctrl.book===UI.livro.book);
   openModal('<div class="mh"><h3>Adicionar linha ao livro</h3><button class="btn ghost sm" data-act="closeModal">Cancelar</button></div>'+
-   '<p class="muted">Só o RT lança linhas manuais. Entrada, saída e perda também ajustam o estoque. Errata registra só o texto da correção, sem mexer na quantidade. Depois de lançada, a linha não pode ser editada nem apagada.</p>'+
+   '<p class="muted">Só o RT lança linhas manuais. Entrada, saída e perda também ajustam o estoque. Errata registra só o texto da correção, sem mexer na quantidade. Depois de lançada, a linha não pode ser editada nem apagada.</p><p class="sm" style="background:var(--warn-bg);color:var(--warn);padding:8px 10px;border-radius:8px"><b>Atendimento duplicado ou indevido?</b> Não lance a devolução aqui. Abra a ficha e use <b>Cancelar atendimento</b>: o sistema lança a errata/estorno no livro e devolve ao estoque os controlados e os insumos, uma vez só.</p>'+
    '<form id="fLine"><div class="grid"><label>Medicamento<select id="lnItem">'+its.map(i=>'<option value="'+i.id+'"'+(i.id===itemId?' selected':'')+'>'+esc(i.name+(i.desc?' '+i.desc:''))+'</option>').join('')+'</select></label>'+
    '<label>Movimento<select id="lnType"><option value="entrada">Entrada</option><option value="saida">Saída</option><option value="perda">Perda</option><option value="errata">Errata</option></select></label>'+
    '<label>Data<input id="lnDate" type="date" required value="'+todayISO()+'"></label>'+
